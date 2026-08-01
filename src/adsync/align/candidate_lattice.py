@@ -7,15 +7,25 @@ against repetitive musical content, with speech-likeness scoring per window.
 from __future__ import annotations
 
 import logging
+import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Callable
 
 import numpy as np
 from numpy.typing import NDArray
-from scipy.signal import fftconvolve, find_peaks
+from scipy.signal import butter, fftconvolve, find_peaks, sosfiltfilt
 
 from adsync.models import CandidateWindow, FeatureBundle, OffsetCandidate
 
 log = logging.getLogger("adsync")
+
+# ── Multi-band correlation ───────────────────────────────────────────────────
+# Narration mixed over the scene contaminates the speech band and dilutes a
+# full-band correlation.  Splitting at these edges (Hz, at the ~4 kHz
+# correlation rate) and normalizing per band keeps the clean bands' vote;
+# the narration-dominant middle band gets the smallest weight.
+_BAND_EDGES = (250.0, 1200.0)
+_BAND_WEIGHTS = (0.4, 0.2, 0.4)   # low, mid (speech), high
 
 
 def build_candidate_lattice(
@@ -28,8 +38,11 @@ def build_candidate_lattice(
     window_sec: float = 8.0,
     step_sec: float = 2.0,
     search_radius_sec: float = 30.0,
+    offset_hint: float = 0.0,
+    offset_hint_fn: Callable[[float], float] | None = None,
     min_score: float = 0.3,
     max_candidates: int = 5,
+    multiband: bool = True,
     on_progress: Callable[[int, int], None] | None = None,
 ) -> list[CandidateWindow]:
     """Scan the AD track in windows and keep top-K offset candidates per window.
@@ -37,6 +50,14 @@ def build_candidate_lattice(
     When *y_vid* and *y_ad* are provided, uses raw-audio cross-correlation
     (downsampled to ~4 kHz) instead of onset features.  This is substantially
     more robust in music-heavy regions where onset patterns repeat.
+
+    *offset_hint* (seconds, positive = AD shifts later) centres each window's
+    video search region on the prevailing global offset, so ``search_radius_sec``
+    buys room for *edits around that offset* rather than being spent reaching
+    the offset itself.  *offset_hint_fn*, when given, overrides it per window:
+    called with the window's AD-time centre, it returns that window's expected
+    offset (e.g. from fingerprint spans), so even huge edits need only a small
+    radius.
 
     Returns a list of :class:`CandidateWindow`, one per analysis position.
     """
@@ -56,10 +77,25 @@ def build_candidate_lattice(
         vid = video_features.onset.astype(np.float64)
         ad = ad_features.onset.astype(np.float64)
         sec_per_sample = video_features.hop_length / video_features.sr
+        multiband = False  # onset features are not a waveform
+
+    # Band decomposition: two zero-phase lowpass copies per track; the three
+    # bands are derived per window by subtraction (low = L0, mid = L1 − L0,
+    # high = full − L1).  Zero-phase filtering keeps peak positions aligned
+    # across bands so the combined correlation stays sub-sample sharp.
+    vid_lp: list[NDArray] = []
+    ad_lp: list[NDArray] = []
+    if multiband:
+        nyq = 0.5 / sec_per_sample
+        for edge in _BAND_EDGES:
+            sos = butter(4, edge / nyq, btype="low", output="sos")
+            vid_lp.append(sosfiltfilt(sos, vid).astype(np.float32))
+            ad_lp.append(sosfiltfilt(sos, ad).astype(np.float32))
 
     win_samples = int(window_sec / sec_per_sample)
     step_samples = int(step_sec / sec_per_sample)
     search_samples = int(search_radius_sec / sec_per_sample)
+    hint_samples = int(round(offset_hint / sec_per_sample))
     min_peak_dist = max(1, win_samples // 4)
 
     # Precompute mel spectrogram info for speech scoring
@@ -73,66 +109,101 @@ def build_candidate_lattice(
 
     ad_positions = list(range(0, len(ad) - win_samples, step_samples))
     total_windows = len(ad_positions)
-    lattice: list[CandidateWindow] = []
 
-    for step_i, ad_start in enumerate(ad_positions):
-        if on_progress is not None:
-            on_progress(step_i, total_windows)
-
+    def _one_window(ad_start: int) -> CandidateWindow:
         ad_seg = ad[ad_start: ad_start + win_samples].copy()
         ad_seg -= np.mean(ad_seg)
         ad_energy = np.sqrt(np.sum(ad_seg ** 2))
         if ad_energy < 1e-10:
             # Silent window — no candidates
             source_center = (ad_start + win_samples / 2) * sec_per_sample
-            lattice.append(CandidateWindow(
+            return CandidateWindow(
                 source_center=source_center,
                 candidates=[],
                 speech_score=0.0,
                 energy=0.0,
-            ))
-            continue
+            )
 
         ad_center_sec = (ad_start + win_samples / 2) * sec_per_sample
 
-        # Search region in video
-        nominal_vid_start = ad_start
+        # Search region in video, centred on the expected offset for this
+        # window (fingerprint-informed when available, global otherwise)
+        if offset_hint_fn is not None:
+            h = int(round(offset_hint_fn(ad_center_sec) / sec_per_sample))
+        else:
+            h = hint_samples
+        nominal_vid_start = ad_start + h
         search_start = max(0, nominal_vid_start - search_samples)
         search_end = min(len(vid), nominal_vid_start + search_samples + win_samples)
 
         if search_end - search_start < win_samples:
-            lattice.append(CandidateWindow(
+            return CandidateWindow(
                 source_center=ad_center_sec,
                 candidates=[],
                 speech_score=0.0,
                 energy=float(ad_energy),
+            )
+
+        def _norm_corr_of(v_reg_in: NDArray, a_seg_in: NDArray) -> NDArray | None:
+            """Normalized sliding correlation of one (pre-sliced) band pair."""
+            a_seg = np.asarray(a_seg_in, np.float64)
+            a_seg = a_seg - np.mean(a_seg)
+            a_energy = np.sqrt(np.sum(a_seg ** 2))
+            if a_energy < 1e-10:
+                return None
+            v_reg = np.asarray(v_reg_in, np.float64)
+            v_reg = v_reg - np.mean(v_reg)
+            raw = fftconvolve(v_reg, a_seg[::-1], mode="valid")
+            if len(raw) == 0:
+                return None
+            v_sq = v_reg ** 2
+            cs_b = np.empty(len(v_sq) + 1, dtype=np.float64)
+            cs_b[0] = 0.0
+            np.cumsum(v_sq, out=cs_b[1:])
+            v_norms_b = np.sqrt(np.maximum(
+                cs_b[win_samples: win_samples + len(raw)] - cs_b[:len(raw)], 1e-20,
             ))
-            continue
+            return raw / (a_energy * v_norms_b)
 
-        v_region = vid[search_start:search_end].astype(np.float64)
-        v_region = v_region - np.mean(v_region)
+        v_full = vid[search_start:search_end]
+        a_full = ad[ad_start: ad_start + win_samples]
+        if vid_lp:
+            # Weighted per-band normalized correlations:
+            # low = L0, mid = L1 − L0 (speech), high = full − L1.
+            v_l0 = vid_lp[0][search_start:search_end]
+            v_l1 = vid_lp[1][search_start:search_end]
+            a_l0 = ad_lp[0][ad_start: ad_start + win_samples]
+            a_l1 = ad_lp[1][ad_start: ad_start + win_samples]
+            pairs = (
+                (v_l0, a_l0),
+                (v_l1 - v_l0, a_l1 - a_l0),
+                (v_full - v_l1, a_full - a_l1),
+            )
+            weights = _BAND_WEIGHTS
+        else:
+            pairs = ((v_full, a_full),)
+            weights = (1.0,)
 
-        # FFT-based sliding cross-correlation
-        raw_corr = fftconvolve(v_region, ad_seg[::-1], mode="valid")
-        n_pos = len(raw_corr)
-        if n_pos == 0:
-            lattice.append(CandidateWindow(
+        norm_corr = None
+        weight_sum = 0.0
+        for (v_sig, a_sig), w_b in zip(pairs, weights):
+            band = _norm_corr_of(v_sig, a_sig)
+            if band is None:
+                continue
+            if norm_corr is None:
+                norm_corr = w_b * band
+            else:
+                norm_corr += w_b * band
+            weight_sum += w_b
+        if norm_corr is None:
+            return CandidateWindow(
                 source_center=ad_center_sec,
                 candidates=[],
                 speech_score=0.0,
                 energy=float(ad_energy),
-            ))
-            continue
-
-        # Per-position energy normalization
-        v_sq = v_region ** 2
-        cs = np.empty(len(v_sq) + 1, dtype=np.float64)
-        cs[0] = 0.0
-        np.cumsum(v_sq, out=cs[1:])
-        v_norms = np.sqrt(np.maximum(
-            cs[win_samples: win_samples + n_pos] - cs[:n_pos], 1e-20,
-        ))
-        norm_corr = raw_corr / (ad_energy * v_norms)
+            )
+        norm_corr /= weight_sum
+        n_pos = len(norm_corr)
 
         mean_corr = float(np.mean(np.abs(norm_corr)))
         peak_indices, _ = find_peaks(norm_corr, distance=min_peak_dist)
@@ -142,13 +213,12 @@ def build_candidate_lattice(
             if norm_corr[best_idx] >= min_score:
                 peak_indices = np.array([best_idx])
             else:
-                lattice.append(CandidateWindow(
+                return CandidateWindow(
                     source_center=ad_center_sec,
                     candidates=[],
                     speech_score=0.0,
                     energy=float(ad_energy),
-                ))
-                continue
+                )
 
         peak_scores = norm_corr[peak_indices]
         top_order = np.argsort(-peak_scores)[:max_candidates]
@@ -160,13 +230,12 @@ def build_candidate_lattice(
         top_scores = top_scores[mask]
 
         if len(top_indices) == 0:
-            lattice.append(CandidateWindow(
+            return CandidateWindow(
                 source_center=ad_center_sec,
                 candidates=[],
                 speech_score=0.0,
                 energy=float(ad_energy),
-            ))
-            continue
+            )
 
         # Build candidates with parabolic refinement and quality metrics
         candidates: list[OffsetCandidate] = []
@@ -214,12 +283,40 @@ def build_candidate_lattice(
             narration_lo, narration_hi,
         )
 
-        lattice.append(CandidateWindow(
+        return CandidateWindow(
             source_center=ad_center_sec,
             candidates=candidates,
             speech_score=speech_score,
             energy=float(ad_energy),
-        ))
+        )
+
+    # Windows are independent, and numpy/scipy release the GIL for the heavy
+    # array work (the FFTs dominate), so a thread pool spreads the scan across
+    # every core without copying the waveforms.  Windows are batched into
+    # chunks so scheduling overhead stays negligible.  Results keep scan order.
+    def _chunk(idx_start: int, idx_end: int) -> list[CandidateWindow]:
+        return [_one_window(ad_positions[i]) for i in range(idx_start, idx_end)]
+
+    slots: list[list[CandidateWindow]] = []
+    if total_windows:
+        n_workers = min(32, os.cpu_count() or 1, total_windows)
+        chunk_len = max(1, min(64, total_windows // (n_workers * 4) or 1))
+        bounds = list(range(0, total_windows, chunk_len))
+        slots = [[] for _ in bounds]
+        with ThreadPoolExecutor(max_workers=n_workers) as pool:
+            futures = {
+                pool.submit(_chunk, b, min(b + chunk_len, total_windows)): i
+                for i, b in enumerate(bounds)
+            }
+            n_done = 0
+            for future in as_completed(futures):
+                result = future.result()
+                slots[futures[future]] = result
+                n_done += len(result)
+                if on_progress is not None:
+                    on_progress(n_done, total_windows)
+
+    lattice: list[CandidateWindow] = [w for chunk in slots for w in chunk]
 
     log.info(
         "Candidate lattice: %d windows, %d with candidates (avg %.1f candidates/window)",
@@ -228,6 +325,74 @@ def build_candidate_lattice(
         np.mean([len(w.candidates) for w in lattice if w.candidates]) if any(w.candidates for w in lattice) else 0,
     )
     return lattice
+
+
+def augment_lattice_with_fingerprint(
+    lattice: list[CandidateWindow],
+    fp,
+    *,
+    half_window: float = 4.0,
+    min_matches: int = 6,
+    max_score: float = 0.8,
+) -> int:
+    """Append fingerprint-derived offset candidates to a starved lattice.
+
+    When two sources carry different *mixes* of the same material (remastered
+    release vs. original-mix AD bed), dense correlation features starve while
+    sparse landmark matches still lock on.  Each window whose ±*half_window*
+    neighbourhood holds at least *min_matches* inlier match pairs gets a
+    candidate at their median offset, scored by local match density — above
+    the decoder's synthetic bridges (0.1) and weak spurious peaks, below a
+    strong genuine correlation (capped at *max_score*).
+
+    Returns the number of windows that received a fingerprint candidate.
+    """
+    if fp is None or fp.match_t_ad is None or len(fp.match_t_ad) == 0:
+        return 0
+
+    t_ad = fp.match_t_ad
+    offs = (fp.match_t_vid - fp.match_t_ad).astype(np.float64)
+    centers = np.array([w.source_center for w in lattice])
+    lo = np.searchsorted(t_ad, centers - half_window, side="left")
+    hi = np.searchsorted(t_ad, centers + half_window, side="right")
+
+    raw = np.full(len(lattice), np.nan)
+    counts = hi - lo
+    for i, (a, b) in enumerate(zip(lo, hi)):
+        if b - a >= min_matches:
+            raw[i] = float(np.median(offs[a:b]))
+
+    # Median-smooth over 5 neighbouring windows: knocks down landmark-grid
+    # jitter (~tens of ms) without rounding off genuine edit steps, which
+    # survive a running median.
+    smoothed = raw.copy()
+    for i in np.nonzero(~np.isnan(raw))[0]:
+        hood = raw[max(0, i - 2): i + 3]
+        hood = hood[~np.isnan(hood)]
+        if len(hood) >= 3:
+            smoothed[i] = float(np.median(hood))
+
+    n_augmented = 0
+    for i, w in enumerate(lattice):
+        if np.isnan(smoothed[i]):
+            continue
+        score = min(max_score, 0.4 + 0.02 * int(counts[i]))
+        w.candidates.append(OffsetCandidate(
+            offset_sec=float(smoothed[i]),
+            score=score,
+            peak_sharpness=1.0,
+            peak_ratio=1.0,
+            source="fingerprint",
+        ))
+        w.candidates.sort(key=lambda c: -c.score)
+        n_augmented += 1
+
+    if n_augmented:
+        log.info(
+            "Fingerprint anchors: %d of %d windows anchored from %d landmark matches",
+            n_augmented, len(lattice), len(t_ad),
+        )
+    return n_augmented
 
 
 def _compute_speech_score(

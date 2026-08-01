@@ -17,6 +17,14 @@ from adsync.models import WarpPath, WarpPoint
 
 log = logging.getLogger("adsync")
 
+# ── Segment vetting ──────────────────────────────────────────────────────────
+_MIN_SEG_SEC = 8.0        # shorter runs cannot establish an offset on their own
+_MIN_SEG_REAL_POINTS = 3  # decoded points above the synthetic floor
+# Real evidence scores >= 0.3 -> confidence >= 0.15; synthetic pass-throughs
+# score 0.1 -> confidence <= 0.10.  0.12 separates them cleanly.
+_SYNTH_CONF = 0.12
+_SEG_CHAIN_TOL = 1.0      # video-time regression allowed between chained segments
+
 
 def fit_warp_function(
     path: list[WarpPoint],
@@ -58,8 +66,20 @@ def fit_warp_function(
         return [fn], [(0.0, ad_duration)], wp
 
     # ── Step 1: Segment the path at discontinuities ────────────────────
+    segments = _split_at_discontinuities(path, discontinuity_threshold, log_jumps=False)
+
+    # ── Step 1.5: Vet segments globally and bridge the rejects ────────
+    # A valid playback map is monotone in video time; sustained excursions
+    # (repeated content matched coherently) lose to the maximum-evidence
+    # monotone chain, and their AD range coasts on the flanking offsets.
+    path, dropped_segments, bridged_sec = _vet_and_bridge(segments)
     segments = _split_at_discontinuities(path, discontinuity_threshold)
-    log.info("Warp fit: %d contiguous segment(s) from %d points", len(segments), len(path))
+    log.info(
+        "Warp fit: %d contiguous segment(s) from %d points%s",
+        len(segments), len(path),
+        (f" ({dropped_segments} excursion segment(s) dropped, "
+         f"{bridged_sec:.0f} s bridged)") if dropped_segments else "",
+    )
 
     warp_fns: list[PchipInterpolator] = []
     segment_ranges: list[tuple[float, float]] = []
@@ -138,6 +158,9 @@ def fit_warp_function(
         anchor_points=all_anchor_points,
         path_cost=path_cost,
         mean_confidence=mean_conf,
+        dropped_segments=dropped_segments,
+        bridged_sec=bridged_sec,
+        n_segments=len(warp_fns),
     )
 
     log.info(
@@ -150,6 +173,7 @@ def fit_warp_function(
 def _split_at_discontinuities(
     path: list[WarpPoint],
     threshold: float,
+    log_jumps: bool = True,
 ) -> list[list[WarpPoint]]:
     """Split path into segments where consecutive offset jumps exceed threshold."""
     if len(path) <= 1:
@@ -160,14 +184,167 @@ def _split_at_discontinuities(
         prev_offset = path[i - 1].target_time - path[i - 1].source_time
         cur_offset = path[i].target_time - path[i].source_time
         if abs(cur_offset - prev_offset) > threshold:
-            log.info(
-                "Discontinuity at t=%.1fs: offset jumps %.2f → %.2f s",
-                path[i].source_time, prev_offset, cur_offset,
-            )
+            if log_jumps:
+                log.info(
+                    "Discontinuity at t=%.1fs: offset jumps %.2f → %.2f s",
+                    path[i].source_time, prev_offset, cur_offset,
+                )
             segments.append([])
         segments[-1].append(path[i])
 
     return [s for s in segments if s]
+
+
+def _real_points(seg: list[WarpPoint]) -> list[WarpPoint]:
+    return [p for p in seg if p.confidence > _SYNTH_CONF]
+
+
+def _strip_synthetic_edges(
+    segments: list[list[WarpPoint]],
+) -> list[list[WarpPoint]]:
+    """Split leading/trailing synthetic runs off each segment.
+
+    Synthetic pass-through points at a segment's edges carry the offset the
+    decoder coasted on, not evidence — left inside the segment they extend
+    its video-time claim past what the evidence supports, which corrupts the
+    monotone arbitration between segments.  Interior synthetics are fine:
+    they sit between real points at the same offset.
+    """
+    out: list[list[WarpPoint]] = []
+    for seg in segments:
+        head = 0
+        while head < len(seg) and seg[head].confidence <= _SYNTH_CONF:
+            head += 1
+        tail = len(seg)
+        while tail > head and seg[tail - 1].confidence <= _SYNTH_CONF:
+            tail -= 1
+        for piece in (seg[:head], seg[head:tail], seg[tail:]):
+            if piece:
+                out.append(piece)
+    return out
+
+
+def _vet_and_bridge(
+    segments: list[list[WarpPoint]],
+) -> tuple[list[WarpPoint], int, float]:
+    """Keep the maximum-evidence monotone chain of segments; bridge the rest.
+
+    Eligible segments (long enough, enough real evidence) compete in a
+    weighted longest-increasing-subsequence over the video-time intervals of
+    their **real** points; weight is summed real-point confidence.  Rejected
+    segments and synthetic edge runs are re-timed at low confidence:
+
+    - When the flanking evidence leaves enough video room for the bridged AD
+      content, it coasts on the left offset up to the gap midpoint and on
+      the right offset after (a plain hole in the video is correct when the
+      video carries content the AD lacks).
+    - When there is **no video room** (AD-only content, e.g. a recap
+      insert), the bridge ramps video time monotonically between the flank
+      evidence points, squeezing the unplaceable content instead of letting
+      it overlap either neighbour.
+
+    Returns the rebuilt point list, the dropped-segment count, and the
+    bridged AD seconds.
+    """
+    segments = _strip_synthetic_edges(segments)
+    n = len(segments)
+    if n <= 1:
+        return [p for seg in segments for p in seg], 0, 0.0
+
+    reals: list[list[WarpPoint]] = [_real_points(seg) for seg in segments]
+    masses = [sum(p.confidence for p in real) for real in reals]
+
+    eligible = [
+        i for i in range(n)
+        if len(reals[i]) >= _MIN_SEG_REAL_POINTS
+        and reals[i][-1].source_time - reals[i][0].source_time >= _MIN_SEG_SEC
+    ]
+    if not eligible:
+        candidates = [i for i in range(n) if reals[i]] or list(range(n))
+        eligible = [max(candidates, key=lambda i: masses[i])]
+
+    # Weighted LIS over real-evidence video intervals (segments are in AD order).
+    m = len(eligible)
+    vid_lo = [
+        (reals[i][0] if reals[i] else segments[i][0]).target_time for i in eligible
+    ]
+    vid_hi = [
+        (reals[i][-1] if reals[i] else segments[i][-1]).target_time for i in eligible
+    ]
+    best = [0.0] * m
+    prev = [-1] * m
+    for a in range(m):
+        best[a] = masses[eligible[a]]
+        for b in range(a):
+            if vid_lo[a] >= vid_hi[b] - _SEG_CHAIN_TOL:
+                cand = best[b] + masses[eligible[a]]
+                if cand > best[a]:
+                    best[a] = cand
+                    prev[a] = b
+    a = int(np.argmax(best))
+    keep: set[int] = set()
+    while a >= 0:
+        keep.add(eligible[a])
+        a = prev[a]
+
+    n_rejected = len(eligible) - len(keep)
+    if len(keep) == n:
+        return [p for seg in segments for p in seg], 0, 0.0
+
+    kept_sorted = sorted(keep)
+    new_points: list[WarpPoint] = []
+    bridged_sec = 0.0
+    for idx, seg in enumerate(segments):
+        if idx in keep:
+            new_points.extend(seg)
+            continue
+        left = next((j for j in reversed(kept_sorted) if j < idx), None)
+        right = next((j for j in kept_sorted if j > idx), None)
+        left_p = reals[left][-1] if left is not None else None
+        right_p = reals[right][0] if right is not None else None
+        if left_p is None and right_p is None:
+            new_points.extend(seg)
+            continue
+
+        if left_p is not None and right_p is not None:
+            ad_span = right_p.source_time - left_p.source_time
+            video_room = right_p.target_time - left_p.target_time
+            if video_room >= ad_span - 0.5:
+                # Video has room: coast on each flank's offset, hole at the
+                # midpoint.
+                mid = 0.5 * (left_p.source_time + right_p.source_time)
+                left_off = left_p.target_time - left_p.source_time
+                right_off = right_p.target_time - right_p.source_time
+                for p in seg:
+                    off = left_off if p.source_time <= mid else right_off
+                    new_points.append(WarpPoint(
+                        source_time=p.source_time,
+                        target_time=p.source_time + off,
+                        confidence=0.05,
+                    ))
+            else:
+                # AD-only content, no video room: squeeze monotonically.
+                rise = max(0.0, video_room)
+                for p in seg:
+                    frac = (p.source_time - left_p.source_time) / max(ad_span, 1e-9)
+                    frac = min(1.0, max(0.0, frac))
+                    new_points.append(WarpPoint(
+                        source_time=p.source_time,
+                        target_time=left_p.target_time + frac * rise,
+                        confidence=0.05,
+                    ))
+        else:
+            flank = left_p if left_p is not None else right_p
+            off = flank.target_time - flank.source_time
+            for p in seg:
+                new_points.append(WarpPoint(
+                    source_time=p.source_time,
+                    target_time=p.source_time + off,
+                    confidence=0.05,
+                ))
+        bridged_sec += seg[-1].source_time - seg[0].source_time
+
+    return new_points, n_rejected, bridged_sec
 
 
 def _select_anchors(

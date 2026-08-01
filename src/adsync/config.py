@@ -45,6 +45,43 @@ class SyncConfig(BaseModel):
     warp_lambda_speech: float = Field(0.3, ge=0.0, description="DP bonus weight for speech-rich windows")
     warp_anchor_fraction: float = Field(0.6, ge=0.1, le=1.0, description="Fraction of decoded points used as PCHIP anchors")
     warp_discontinuity_threshold: float = Field(2.0, ge=0.5, description="Offset jump (seconds) to declare a timing discontinuity")
+    warp_search_radius: float | None = Field(
+        None,
+        description="Per-window video-position search radius in seconds, centred on the "
+        "global-offset hint. None = auto: scales with the video/AD duration gap and the "
+        "measured offset scatter, so large edits stay inside the search range.",
+    )
+    multiband: bool = Field(
+        True,
+        description="Correlate in three frequency bands (per-band normalized, "
+        "speech band down-weighted) so narration over quiet scenes cannot "
+        "drown the correlation evidence.",
+    )
+
+    # fingerprinting
+    fingerprint: bool = Field(
+        True,
+        description="Landmark-fingerprint the pair before alignment: locates offset "
+        "spans and edit points globally (no search radius), flags unmatched AD "
+        "regions, and steers warp mode's per-window search.",
+    )
+    speed_detect: bool = Field(
+        True,
+        description="When the fingerprint finds nothing (or a steep offset ramp), "
+        "probe standard transfer ratios (PAL 25/24 and its inverse), refine the "
+        "exact stretch from span offsets, and auto-correct the AD's speed and "
+        "pitch before aligning.",
+    )
+    fp_anchor: bool = Field(
+        True,
+        description="When windowed correlation starves (different mixes of the same "
+        "material) but fingerprint evidence is strong, anchor alignment windows "
+        "directly on landmark matches.",
+    )
+    fp_anchor_min_coverage: float = Field(
+        0.5, ge=0.0, le=1.0,
+        description="Correlation coverage below which fingerprint anchoring kicks in",
+    )
 
     # mode
     mode: Literal["auto", "offset", "drift", "piecewise", "warp"] = Field("auto", description="auto|offset|drift|piecewise|warp")

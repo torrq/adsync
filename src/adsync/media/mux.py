@@ -12,7 +12,7 @@ from numpy.typing import NDArray
 
 from adsync.utils.subprocesses import run_ffmpeg_streamed
 
-# ~1 MB per chunk at 2 bytes / sample → constant memory overhead
+# ~2 MB per chunk at 4 bytes / sample → constant memory overhead
 _CHUNK_SAMPLES = 512 * 1024
 
 log = logging.getLogger("adsync")
@@ -50,7 +50,7 @@ def mux_ad_track(
 
     args = [
         "-i", str(video_path),
-        "-f", "s16le", "-ar", str(sr), "-ac", str(n_channels), "-i", "pipe:0",
+        "-f", "f32le", "-ar", str(sr), "-ac", str(n_channels), "-i", "pipe:0",
         "-map", "0",
         "-map", "1:a:0",
         "-c", "copy",
@@ -85,8 +85,9 @@ def mux_ad_track(
         task = progress.add_task("Encoding AD track", total=total_chunks)
         for start in range(0, total_samples, _CHUNK_SAMPLES):
             chunk = synced_y[..., start : start + _CHUNK_SAMPLES]
-            pcm = np.clip(chunk, -1.0, 1.0)
-            pcm = (pcm * 32767).astype(np.int16)
+            # Float straight through to the encoder — no 16-bit quantization
+            # stage. The renderers guarantee peak <= 0.99; clip is a belt.
+            pcm = np.clip(chunk, -1.0, 1.0).astype(np.float32, copy=False)
             if pcm.ndim == 2:
                 pcm = np.ascontiguousarray(pcm.T)
             proc.stdin.write(pcm.tobytes())

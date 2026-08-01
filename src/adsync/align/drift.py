@@ -7,6 +7,7 @@ from typing import Callable
 
 import numpy as np
 from numpy.typing import NDArray
+from scipy.signal import fftconvolve
 
 from adsync.models import Anchor, FeatureBundle
 
@@ -190,8 +191,9 @@ def _local_offset(
     a_region = ad[a_region_start:a_region_end].copy()
     a_region -= np.mean(a_region)
 
-    # Vectorized sliding cross-correlation
-    full_corr = np.correlate(a_region, v_seg, mode="valid")
+    # FFT-based sliding cross-correlation (identical to np.correlate "valid",
+    # but O(n log n) — direct correlation at these sizes costs seconds per anchor)
+    full_corr = fftconvolve(a_region, v_seg[::-1], mode="valid")
     if len(full_corr) == 0:
         return None
 

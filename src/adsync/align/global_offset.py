@@ -25,11 +25,14 @@ def estimate_global_offset(
     y_vid: NDArray | None = None,
     y_ad: NDArray | None = None,
     sr: int = 16000,
-) -> tuple[float, float]:
+) -> tuple[float, float, list[float]]:
     """Estimate a single global offset (seconds) and a confidence score.
 
-    Returns (offset_seconds, confidence) where a **positive** offset means the
-    AD track should be shifted *later* relative to the video timeline.
+    Returns (offset_seconds, confidence, window_offsets) where a **positive**
+    offset means the AD track should be shifted *later* relative to the video
+    timeline.  *window_offsets* holds the per-probe-window offsets — their
+    spread tells downstream stages how far offsets wander (e.g. across an
+    edit discontinuity), which sizes the warp search radius.
 
     When raw audio arrays *y_vid* and *y_ad* are provided, the offset is
     computed on downsampled raw waveforms (robust to musical periodicity).
@@ -40,7 +43,7 @@ def estimate_global_offset(
     sec_per_frame = hop / feat_sr
 
     if y_vid is not None and y_ad is not None:
-        offset_sec, best_score = _raw_audio_offset(
+        offset_sec, best_score, window_offsets = _raw_audio_offset(
             y_vid, y_ad, sr, max_offset_sec,
         )
         # Verify with onset features at the detected offset
@@ -66,6 +69,7 @@ def estimate_global_offset(
         region_scores = _verify_across_regions(vid_onset, ad_onset, best_lag, n_regions=5)
         mean_region = float(np.mean(region_scores)) if region_scores else 0.0
         confidence = 0.5 * best_score + 0.5 * mean_region
+        window_offsets = [offset_sec]
 
     confidence = max(0.0, min(1.0, confidence))
 
@@ -73,7 +77,7 @@ def estimate_global_offset(
         "Global offset: %.3f s  (peak=%.3f, regions=%.3f, conf=%.3f)",
         offset_sec, best_score, mean_region, confidence,
     )
-    return offset_sec, confidence
+    return offset_sec, confidence, window_offsets
 
 
 def _raw_audio_offset(
@@ -81,7 +85,7 @@ def _raw_audio_offset(
     y_ad: NDArray,
     sr: int,
     max_offset_sec: float,
-) -> tuple[float, float]:
+) -> tuple[float, float, list[float]]:
     """Find offset using multi-window normalized cross-correlation at full SR.
 
     Takes several 30-second windows from the video audio and searches for
@@ -95,7 +99,7 @@ def _raw_audio_offset(
     # Place windows evenly across the shorter track
     usable = min(len(y_vid), len(y_ad)) - win
     if usable < win:
-        return 0.0, 0.0
+        return 0.0, 0.0, []
 
     offsets: list[float] = []
     scores_list: list[float] = []
@@ -158,7 +162,7 @@ def _raw_audio_offset(
                   v_start / sr, local_offset, score)
 
     if not offsets:
-        return 0.0, 0.0
+        return 0.0, 0.0, []
 
     offsets_arr = np.array(offsets)
     scores_arr = np.array(scores_list)
@@ -210,7 +214,7 @@ def _raw_audio_offset(
 
     log.debug("Raw audio offset: %.4f s (best_score=%.4f, %d windows)",
               final_offset, best_score, len(offsets))
-    return final_offset, best_score
+    return final_offset, best_score, offsets
 
 
 def _znorm(x: NDArray) -> NDArray:
@@ -227,7 +231,7 @@ def _norm_cross_correlation(a: NDArray, b: NDArray, max_lag: int) -> NDArray:
     a = a[:n]
     b = b[:n]
 
-    full_corr = np.correlate(a, b, mode="full")
+    full_corr = fftconvolve(a, b[::-1], mode="full")
     # The zero-lag position in 'full' mode is at index len(b)-1
     center = len(b) - 1
     start = max(center - max_lag, 0)

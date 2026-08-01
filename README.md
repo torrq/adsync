@@ -36,6 +36,7 @@ Either the alignment holds end-to-end, or the confidence score flags it up front
 
 - One command in, one MKV out, with the AD embedded as a tagged, selectable track.
 - Handles constant offset, linear clock drift, and discontinuous edits (ad-break changes, missing scenes, inserted recaps) in the same pipeline.
+- Audio landmark fingerprinting (Shazam-style constellation hashes) maps which stretch of the AD sits at which offset **globally** — edits of any size are located before alignment runs, and AD regions that match nowhere in the video are called out as bad spots in the report.
 - Global warp alignment: a Viterbi decoder walks the candidate lattice and fits a shape-preserving monotone warp, so the whole track is solved as one piece.
 - Sub-sample accuracy via parabolic interpolation around cross-correlation peaks, roughly 1–3 ms.
 - Streams PCM straight into FFmpeg, no huge temp files. Every run produces a confidence score and a warnings list.
@@ -87,6 +88,12 @@ That's it. Open the resulting MKV in VLC, MPV, Plex, or Jellyfin, pick the "Audi
 ## Commands
 
 ```bash
+# Prep a source first (optional) — keep one language's audio as stereo, drop the rest.
+# Video/subs are stream-copied; already-stereo tracks are copied too (remux speed).
+# Multichannel tracks get a dialog-forward downmix + true-peak limiter (libopus,
+# ~4x faster than the aac encoder; pass --codec aac if you need AAC).
+adsync prep episode.mkv --language eng
+
 # Full sync — produces the final MKV with AD embedded
 adsync sync episode.mkv ad_track.m4a -o episode.synced.mkv
 
@@ -115,6 +122,8 @@ adsync mux episode.mkv already_synced_ad.m4a -o final.mkv
 | `--warp-lambda-curve` | `5.0` | Warp DP penalty for curvature |
 | `--warp-lambda-speech` | `0.3` | Warp bonus for speech-rich windows |
 | `--warp-candidates` | `5` | Max offset candidates per analysis window |
+| `--warp-search-radius` | auto | Per-window search radius (s) around the detected offset; auto shrinks to fingerprint span hints, else scales with the duration gap and offset scatter |
+| `--no-fingerprint` | off | Skip landmark fingerprinting (span detection, bad-spot warnings, per-window warp hints) |
 
 Run `adsync <command> --help` for the full list.
 
@@ -126,11 +135,16 @@ If you have the tracks, it works.
 
 ## Known artifacts
 
-- Occasional brief pitch drift, a few seconds long and self-correcting. You can sometimes hear the narration's pitch shift slightly before snapping back. It's a side effect of time-warping the AD to match the video timeline. On the list to fix, probably by swapping the inner resampler for a phase-vocoder or WSOLA path so stretch doesn't touch pitch.
+- None currently tracked. (The transient pitch drift during warped stretching was fixed by re-rendering stretch regions through a pitch-preserving WSOLA path — see `src/adsync/rebuild/warp_render.py`.)
+
+## Measured accuracy
+
+`tools/accuracy_harness.py` applies edits with exactly known time maps (cuts up to 45 s, insertions, offsets, 200 ppm clock drift) to real movie audio and scores every reported anchor against ground truth. Current numbers across all eight scenarios: **median placement error ≤ 2.6 ms, worst anchor ≤ 35 ms, 100% of anchors within 50 ms**. The harness doubles as the regression gate for alignment changes.
 
 ## Roadmap
 
-- [ ] Eliminate the transient pitch drift during warped stretching (WSOLA or phase-vocoder resampler)
+- [x] Eliminate the transient pitch drift during warped stretching (WSOLA or phase-vocoder resampler)
+- [x] Audio landmark fingerprinting: global offset-span detection, edit localization, and bad-spot (unmatched content) warnings
 - [ ] Optional GPU-accelerated cross-correlation for faster runs on long files
 - [ ] Precomputed AD offset database / cache
 - [ ] Web UI for non-technical users
