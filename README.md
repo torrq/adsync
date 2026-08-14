@@ -37,7 +37,10 @@ Either the alignment holds end-to-end, or the confidence score flags it up front
 - One command in, one MKV out, with the AD embedded as a tagged, selectable track.
 - Handles constant offset, linear clock drift, and discontinuous edits (ad-break changes, missing scenes, inserted recaps) in the same pipeline.
 - Audio landmark fingerprinting (Shazam-style constellation hashes) maps which stretch of the AD sits at which offset **globally** — edits of any size are located before alignment runs, and AD regions that match nowhere in the video are called out as bad spots in the report.
-- Global warp alignment: a Viterbi decoder walks the candidate lattice and fits a shape-preserving monotone warp, so the whole track is solved as one piece.
+- Automatic speed detection. A PAL-sourced AD runs 25/24 fast with the pitch up and looks like a total mismatch; ADSync probes the standard transfer ratios, measures the exact stretch, and corrects speed and pitch before aligning. The applied correction goes in the report.
+- Repeated soundtrack content is filtered against monotone playback, so a credits song that also plays twenty minutes earlier can't drag a stretch of the AD to a physically impossible position.
+- Global warp alignment: a Viterbi decoder walks the candidate lattice and fits a shape-preserving monotone warp, so the whole track is solved as one piece. When the two sources carry different mixes of the same material and correlation starves, the fingerprint matches themselves anchor the alignment.
+- After fitting, the warp is checked back against the fingerprint matches and the residuals (median/p95 in ms) go in the report — "verified" is a measurement, not a mood.
 - Sub-sample accuracy via parabolic interpolation around cross-correlation peaks, roughly 1–3 ms.
 - Streams PCM straight into FFmpeg, no huge temp files. Every run produces a confidence score and a warnings list.
 - Debug mode that dumps feature CSVs, plots, and intermediate WAVs when you want to see what the aligner saw.
@@ -124,12 +127,17 @@ adsync mux episode.mkv already_synced_ad.m4a -o final.mkv
 | `--warp-candidates` | `5` | Max offset candidates per analysis window |
 | `--warp-search-radius` | auto | Per-window search radius (s) around the detected offset; auto shrinks to fingerprint span hints, else scales with the duration gap and offset scatter |
 | `--no-fingerprint` | off | Skip landmark fingerprinting (span detection, bad-spot warnings, per-window warp hints) |
+| `--no-speed-detect` | off | Skip automatic PAL-style speed detection and correction |
+| `--no-fp-anchor` | off | Never anchor windows on fingerprint matches when correlation starves (differing mixes) |
+| `--no-multiband` | off | Correlate full-band only, instead of three weighted bands with the narration band turned down |
 
 Run `adsync <command> --help` for the full list.
 
-## Tested on *From*
+## Tested on real material
 
-I've been running this end-to-end on episodes of *From* (the MGM+ horror/mystery series), pairing fan-contributed AD tracks with retail releases. Sync has held up on everything I've tried so far, including one episode where the AD and video had a real edit discontinuity mid-way through. Warp mode handled that as a single offset jump instead of trying to force a linear drift fit across it.
+This started on episodes of *From* (the MGM+ horror/mystery series), pairing fan-contributed AD tracks with retail releases. Sync held up on everything, including one episode where the AD and video had a real edit discontinuity mid-way through. Warp mode handled that as a single offset jump instead of trying to force a linear drift fit across it.
+
+Since then it's been through a stack of feature films, and the two that fought hardest each turned into a feature. An AD rip of *The Exorcist* ran about 4% fast with the pitch up — a PAL transfer — which is where automatic speed detection came from. *Sinister* has a credits song that also plays much earlier in the film, and those repeated landmarks kept voting a stretch of the AD to a spot fifteen minutes before where it belonged — which is where the repeated-content filtering came from. Both sync clean now.
 
 If you have the tracks, it works.
 
@@ -139,12 +147,14 @@ If you have the tracks, it works.
 
 ## Measured accuracy
 
-`tools/accuracy_harness.py` applies edits with exactly known time maps (cuts up to 45 s, insertions, offsets, 200 ppm clock drift) to real movie audio and scores every reported anchor against ground truth. Current numbers across all eight scenarios: **median placement error ≤ 2.6 ms, worst anchor ≤ 35 ms, 100% of anchors within 50 ms**. The harness doubles as the regression gate for alignment changes.
+`tools/accuracy_harness.py` applies edits with exactly known time maps (cuts up to 45 s, insertions, offsets, 200 ppm clock drift, a PAL-speed transfer) to real movie audio and scores every reported anchor against ground truth. Current numbers across all nine scenarios: **median placement error ≤ 10 ms (typically ~2.5 ms), p95 ≤ 16 ms, at least 99% of anchors within 50 ms** — the rare stragglers sit right on edit boundaries, where the true cut point is only defined to within an analysis window anyway. The harness doubles as the regression gate for alignment changes.
 
 ## Roadmap
 
 - [x] Eliminate the transient pitch drift during warped stretching (WSOLA or phase-vocoder resampler)
 - [x] Audio landmark fingerprinting: global offset-span detection, edit localization, and bad-spot (unmatched content) warnings
+- [x] Automatic detection and correction of PAL-style speed transfers
+- [x] Repeated-content defenses: monotone-playback filtering, excursion vetting, and post-fit verification against fingerprint matches
 - [ ] Optional GPU-accelerated cross-correlation for faster runs on long files
 - [ ] Precomputed AD offset database / cache
 - [ ] Web UI for non-technical users
