@@ -48,6 +48,26 @@ def test_fp_residual_moves_confidence() -> None:
     assert any("residual" in w.lower() for w in warns), warns
 
 
+def test_coverage_excludes_synthetic_points() -> None:
+    """Synthetic pass-throughs (score 0.1 → confidence <= 0.10) are not
+    evidence; a path that is mostly synthetics must trip the coverage gate
+    even though their confidence sits above the old 0.05 cutoff."""
+    real = _path(30, conf=0.5)
+    synthetic = [
+        WarpPoint(source_time=60.0 + 2.0 * i, target_time=106.0 + 2.0 * i, confidence=0.08)
+        for i in range(170)
+    ]
+    wp = WarpPath(points=real + synthetic, anchor_points=real, mean_confidence=0.2)
+    conf, warns = compute_confidence([], [], AD_DUR, VID_DUR, mode="warp", warp_path=wp)
+    assert any("coverage" in w.lower() for w in warns), warns
+
+    solid, warns_solid = compute_confidence(
+        [], [], AD_DUR, VID_DUR, mode="warp", warp_path=_wp(points=_path(200, conf=0.15)),
+    )
+    assert not any("coverage" in w.lower() for w in warns_solid), warns_solid
+    assert conf < solid
+
+
 def test_summary_names_warp_segments_and_avoids_glyphs() -> None:
     report = SyncReport(
         mode="warp",

@@ -30,6 +30,39 @@ def crossfade(a: NDArray[np.floating], b: NDArray[np.floating], n_samples: int) 
     return result
 
 
+def catmull_rom_interp(
+    src: NDArray[np.floating],
+    pos: NDArray[np.float64],
+    out: NDArray[np.float32],
+) -> NDArray[np.float32]:
+    """Resample *src* at fractional sample positions *pos* into *out*.
+
+    Catmull-Rom cubic over the last axis; edge samples replicate.  Linear
+    interpolation loses ~3 dB at sr/4 for a constant half-sample offset —
+    an audible dulling on a full film mix — while the cubic stays within
+    ~1 dB there.  *out* must have *src*'s leading shape with last axis
+    ``len(pos)``.
+    """
+    n = src.shape[-1]
+    pos = np.clip(pos, 0.0, n - 1.0)
+    idx = pos.astype(np.int64)
+    np.clip(idx, 0, n - 2, out=idx)
+    u = (pos - idx).astype(np.float32)
+    p0 = src[..., np.maximum(idx - 1, 0)]
+    p1 = src[..., idx]
+    p2 = src[..., idx + 1]
+    p3 = src[..., np.minimum(idx + 2, n - 1)]
+    u2 = u * u
+    u3 = u2 * u
+    out[...] = 0.5 * (
+        2.0 * p1
+        + (p2 - p0) * u
+        + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * u2
+        + (3.0 * (p1 - p2) + (p3 - p0)) * u3
+    )
+    return out
+
+
 def linear_fit_offset(times: NDArray[np.floating], offsets: NDArray[np.floating]) -> tuple[float, float]:
     """Return (intercept, slope) for offset-vs-time via least-squares."""
     if len(times) < 2:

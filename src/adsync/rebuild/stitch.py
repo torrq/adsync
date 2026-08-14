@@ -60,15 +60,23 @@ def stitch_segments(
         if chunk.shape[-1] == 0:
             continue
 
-        if i > 0 and crossfade_samples > 0:
-            prev_end = chunks[i - 1][0] + chunks[i - 1][1].shape[-1]
+        if i > 0:
+            prev_end = min(chunks[i - 1][0] + chunks[i - 1][1].shape[-1], output_len)
             overlap = prev_end - dst_start
             if overlap > 0:
                 xf_len = min(crossfade_samples, overlap, chunk.shape[-1])
-                fade_in = np.linspace(0.0, 1.0, xf_len, dtype=np.float32)
-                fade_out = np.linspace(1.0, 0.0, xf_len, dtype=np.float32)
-                output[..., dst_start: dst_start + xf_len] *= fade_out
-                chunk[..., :xf_len] *= fade_in
+                if xf_len > 0:
+                    fade_in = np.linspace(0.0, 1.0, xf_len, dtype=np.float32)
+                    fade_out = np.linspace(1.0, 0.0, xf_len, dtype=np.float32)
+                    output[..., dst_start: dst_start + xf_len] *= fade_out
+                    chunk[..., :xf_len] *= fade_in
+                # A clamped stretch can overshoot the next segment's start by
+                # far more than the crossfade; that tail would play doubled
+                # under the new segment.  The new segment's anchors own this
+                # range — silence the stale audio before adding.
+                stale_end = min(prev_end, end)
+                if stale_end > dst_start + xf_len:
+                    output[..., dst_start + xf_len: stale_end] = 0.0
 
         output[..., dst_start:end] += chunk
 

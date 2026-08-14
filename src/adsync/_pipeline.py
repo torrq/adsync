@@ -89,7 +89,7 @@ def run_pipeline(
             futures = [
                 pool.submit(extract_audio, video_info, vid_wav, sr=config.analysis_sr, mono=config.mono, stream_index=vid_audio_index),
                 pool.submit(extract_audio, ad_info, ad_wav, sr=config.analysis_sr, mono=config.mono),
-                pool.submit(extract_audio, ad_info, ad_hq_wav, sr=ad_hq_sr, mono=False),
+                pool.submit(extract_audio, ad_info, ad_hq_wav, sr=ad_hq_sr, mono=False, sample_fmt="f32"),
             ]
             for f in as_completed(futures):
                 f.result()
@@ -177,7 +177,7 @@ def run_pipeline(
                 # The HQ rebuild source must carry the same correction.
                 extract_audio(
                     ad_info, ad_hq_wav, sr=ad_hq_sr, mono=False,
-                    speed_ratio=det.stretch,
+                    speed_ratio=det.stretch, sample_fmt="f32",
                 )
 
         # Distinct fingerprint offset spans mean the material has edits a

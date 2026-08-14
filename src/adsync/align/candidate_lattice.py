@@ -11,6 +11,7 @@ import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Callable
 
+import librosa
 import numpy as np
 from numpy.typing import NDArray
 from scipy.signal import butter, fftconvolve, find_peaks, sosfiltfilt
@@ -99,13 +100,14 @@ def build_candidate_lattice(
     min_peak_dist = max(1, win_samples // 4)
 
     # Precompute mel spectrogram info for speech scoring
-    mel = ad_features.mel  # (n_mels, n_frames)
+    mel = ad_features.mel  # (n_mels, n_frames), dB re track max
     mel_hop_sec = ad_features.hop_length / ad_features.sr
     n_mels = mel.shape[0]
-    # Narration band: ~100-4000 Hz mapped to mel bin indices
-    # At sr=16000, mel bands 0..n_mels span 0..8000 Hz roughly linearly in mel
-    narration_lo = max(0, int(n_mels * 100 / 8000))
-    narration_hi = min(n_mels, int(n_mels * 4000 / 8000))
+    # Narration band: ~100-4000 Hz.  Mel bins are not linearly spaced in Hz,
+    # so map through the same mel frequencies the spectrogram was built with.
+    mel_freqs = librosa.mel_frequencies(n_mels=n_mels, fmin=0.0, fmax=ad_features.sr / 2.0)
+    narration_lo = int(np.searchsorted(mel_freqs, 100.0))
+    narration_hi = max(narration_lo + 1, int(np.searchsorted(mel_freqs, 4000.0)))
 
     ad_positions = list(range(0, len(ad) - win_samples, step_samples))
     total_windows = len(ad_positions)
@@ -417,10 +419,10 @@ def _compute_speech_score(
 
     window_mel = mel[:, frame_start:frame_end]
 
-    # Convert from dB back to power for spectral flatness
-    # mel might already be in power or dB depending on extract_basic
-    # Use the raw values — relative flatness is what matters
-    power = np.maximum(window_mel, 1e-10)
+    # extract_basic stores mel in dB (power_to_db, ref=track max, so values
+    # are <= 0).  Flatness and the band ratio both need linear power; the
+    # relative scale from the dB reference cancels out of both.
+    power = np.power(10.0, 0.1 * window_mel)
 
     # Spectral flatness per frame: geometric_mean / arithmetic_mean
     log_mean = np.mean(np.log(power + 1e-10), axis=0)

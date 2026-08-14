@@ -86,12 +86,12 @@ def decode_warp_path(
 
     Returns
     -------
-    list[WarpPoint]
+    tuple[list[WarpPoint], float]
         One point per lattice window (including synthetic fill-ins for
-        empty windows).
+        empty windows), and the total path cost.
     """
     if not lattice:
-        return []
+        return [], 0.0
 
     # ── Prepare the lattice: inject synthetic pass-through candidates ───
     # For windows with no candidates, create one that inherits the median
@@ -103,7 +103,7 @@ def decode_warp_path(
 
     if all(k == 0 for k in Ks):
         log.warning("No candidates in any window — returning empty warp path")
-        return []
+        return [], 0.0
 
     # Drift expectation: offset change per second
     drift_per_sec = (drift_hint_ppm or 0.0) * 1e-6

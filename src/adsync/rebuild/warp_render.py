@@ -21,6 +21,8 @@ import numpy as np
 from numpy.typing import NDArray
 from scipy.interpolate import PchipInterpolator
 
+from adsync.utils.mathx import catmull_rom_interp
+
 log = logging.getLogger("adsync")
 
 _BLOCK_SECONDS = 30
@@ -97,7 +99,7 @@ def _render_single_segment(
     block = sr * _BLOCK_SECONDS
     for start in range(valid_lo, valid_hi, block):
         end = min(start + block, valid_hi)
-        _interp_into(y_ad, sr, inverse_fn, ad_len, output[..., start:end], start, end)
+        _interp_into(y_ad, sr, inverse_fn, output[..., start:end], start, end)
 
     _apply_pitch_regions(y_ad, sr, inverse_fn, ad_len, output, valid_lo, valid_hi)
 
@@ -135,18 +137,25 @@ def _render_multi_segment(
 
         xf_len = 0
         fade_in: NDArray[np.float32] | None = None
-        if placed and crossfade_samples > 0:
+        if placed:
             overlap = placed[-1][1] - out_start
             if overlap > 0:
                 xf_len = min(crossfade_samples, overlap, out_end - out_start)
-                t = np.linspace(0.0, np.pi, xf_len, dtype=np.float32)
-                output[..., out_start:out_start + xf_len] *= 0.5 * (1.0 + np.cos(t))
-                fade_in = 0.5 * (1.0 - np.cos(t))
+                if xf_len > 0:
+                    t = np.linspace(0.0, np.pi, xf_len, dtype=np.float32)
+                    output[..., out_start:out_start + xf_len] *= 0.5 * (1.0 + np.cos(t))
+                    fade_in = 0.5 * (1.0 - np.cos(t))
+                # Segment video claims may overlap past the crossfade (chain
+                # tolerance); the stale tail would play doubled under this
+                # segment's render.  This segment owns the range — silence it.
+                stale_end = min(placed[-1][1], out_end)
+                if stale_end > out_start + xf_len:
+                    output[..., out_start + xf_len: stale_end] = 0.0
 
         for start in range(out_start, out_end, block):
             end = min(start + block, out_end)
             chunk = buf[..., : end - start]
-            _interp_into(y_ad, sr, inverse_fn, ad_len, chunk, start, end)
+            _interp_into(y_ad, sr, inverse_fn, chunk, start, end)
             if fade_in is not None and start == out_start:
                 chunk[..., :xf_len] *= fade_in
             output[..., start:end] += chunk
@@ -164,7 +173,6 @@ def _interp_into(
     y_ad: NDArray[np.float32],
     sr: int,
     inverse_fn: PchipInterpolator,
-    ad_len: int,
     dest: NDArray[np.float32],
     out_start: int,
     out_end: int,
@@ -173,14 +181,7 @@ def _interp_into(
     t /= sr
     src = inverse_fn(t)
     src *= sr
-    np.clip(src, 0.0, ad_len - 1.0, out=src)
-    idx = src.astype(np.int64)
-    np.clip(idx, 0, ad_len - 2, out=idx)
-    np.subtract(src, idx, out=src)
-    frac = src.astype(np.float32)
-    np.multiply(y_ad[..., idx], 1.0 - frac, out=dest)
-    idx += 1
-    dest += y_ad[..., idx] * frac
+    catmull_rom_interp(y_ad, src, dest)
 
 
 def _invert_pchip(
@@ -245,7 +246,7 @@ def _apply_pitch_regions(
         ):
             n = sub_hi - sub_lo
             interp = np.empty_like(wsola)
-            _interp_into(y_ad, sr, inverse_fn, ad_len, interp, sub_lo, sub_hi)
+            _interp_into(y_ad, sr, inverse_fn, interp, sub_lo, sub_hi)
             np.subtract(wsola, interp, out=wsola)
 
             head = sub_lo - reg_lo  # sub-span offset within the region

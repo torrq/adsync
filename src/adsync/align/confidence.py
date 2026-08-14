@@ -142,11 +142,15 @@ def _warp_confidence(
     warnings: list[str] = []
     factors: list[float] = []
 
-    # 1. Warp path consistency — fraction of points with any candidates
+    # 1. Warp path consistency — fraction of points backed by real evidence.
+    # The threshold must sit between synthetic pass-throughs (score 0.1 →
+    # confidence <= 0.10) and the weakest real candidate (score 0.3 →
+    # confidence >= 0.15); warp_fit uses the same separator for vetting.
+    from adsync.align.warp_fit import _SYNTH_CONF
+
     coverage = 0.0
     if warp_path.points:
-        # Points with real (non-synthetic) confidence
-        real_points = [p for p in warp_path.points if p.confidence > 0.05]
+        real_points = [p for p in warp_path.points if p.confidence > _SYNTH_CONF]
         coverage = len(real_points) / len(warp_path.points)
         factors.append(coverage)
         if coverage < 0.5:

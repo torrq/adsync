@@ -75,32 +75,43 @@ def mux_ad_track(
 
     total_chunks = (total_samples + _CHUNK_SAMPLES - 1) // _CHUNK_SAMPLES
 
-    with Progress(
-        "[progress.description]{task.description}",
-        BarColumn(),
-        "[progress.percentage]{task.percentage:>3.0f}%",
-        TimeRemainingColumn(),
-        transient=True,
-    ) as progress:
-        task = progress.add_task("Encoding AD track", total=total_chunks)
-        for start in range(0, total_samples, _CHUNK_SAMPLES):
-            chunk = synced_y[..., start : start + _CHUNK_SAMPLES]
-            # Float straight through to the encoder — no 16-bit quantization
-            # stage. The renderers guarantee peak <= 0.99; clip is a belt.
-            pcm = np.clip(chunk, -1.0, 1.0).astype(np.float32, copy=False)
-            if pcm.ndim == 2:
-                pcm = np.ascontiguousarray(pcm.T)
-            proc.stdin.write(pcm.tobytes())
-            progress.advance(task)
+    stream_error: OSError | None = None
+    try:
+        with Progress(
+            "[progress.description]{task.description}",
+            BarColumn(),
+            "[progress.percentage]{task.percentage:>3.0f}%",
+            TimeRemainingColumn(),
+            transient=True,
+        ) as progress:
+            task = progress.add_task("Encoding AD track", total=total_chunks)
+            for start in range(0, total_samples, _CHUNK_SAMPLES):
+                chunk = synced_y[..., start : start + _CHUNK_SAMPLES]
+                # Float straight through to the encoder — no 16-bit quantization
+                # stage. The renderers guarantee peak <= 0.99; clip is a belt.
+                pcm = np.clip(chunk, -1.0, 1.0).astype(np.float32, copy=False)
+                if pcm.ndim == 2:
+                    pcm = np.ascontiguousarray(pcm.T)
+                proc.stdin.write(pcm.tobytes())
+                progress.advance(task)
+    except OSError as exc:
+        # FFmpeg died mid-stream (bad output path, disk full, encoder error).
+        # The pipe error itself says nothing — fall through and surface
+        # FFmpeg's stderr instead.
+        stream_error = exc
+    finally:
+        try:
+            proc.stdin.close()
+        except OSError:
+            pass
 
-    proc.stdin.close()
     proc.wait()
     drain.join()
 
-    if proc.returncode != 0:
+    if proc.returncode != 0 or stream_error is not None:
         stderr = b"".join(stderr_buf)
         raise subprocess.CalledProcessError(
-            proc.returncode, "ffmpeg", stderr=stderr,
+            proc.returncode if proc.returncode != 0 else 1, "ffmpeg", stderr=stderr,
         )
 
     log.info("Muxed output → %s", output_path)

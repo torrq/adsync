@@ -149,6 +149,17 @@ def fit_warp_function(
         # Last segment extends to ad_duration
         sN_start, sN_end = segment_ranges[-1]
         segment_ranges[-1] = (sN_start, ad_duration)
+        # Interior ranges end at decoded window centres, one step apart —
+        # left as-is, the AD audio between two segments belongs to neither
+        # and vanishes from the render.  Meet at the midpoint instead; the
+        # true edit point is only localized to within a window anyway.
+        for i in range(len(segment_ranges) - 1):
+            a_start, a_end = segment_ranges[i]
+            b_start, b_end = segment_ranges[i + 1]
+            if b_start > a_end:
+                mid = 0.5 * (a_end + b_start)
+                segment_ranges[i] = (a_start, mid)
+                segment_ranges[i + 1] = (mid, b_end)
 
     mean_conf = float(np.mean([p.confidence for p in path])) if path else 0.0
     path_cost = 0.0  # Filled by decoder if needed
@@ -379,10 +390,10 @@ def _select_anchors(
 def _enforce_monotonicity(anchors: list[WarpPoint]) -> list[WarpPoint]:
     """Remove points that violate strict target_time monotonicity.
 
-    Uses a patience-based longest increasing subsequence (LIS) on
-    target_time, weighted by confidence to prefer high-quality points.
-    This guarantees the result is strictly increasing in both
-    source_time and target_time.
+    Maximum-confidence increasing subsequence on target_time via an O(n^2)
+    DP (n is small — typically < 1000), so a run of high-confidence points
+    beats a longer run of low-confidence violators.  This guarantees the
+    result is strictly increasing in both source_time and target_time.
     """
     if len(anchors) <= 1:
         return anchors
@@ -390,19 +401,18 @@ def _enforce_monotonicity(anchors: list[WarpPoint]) -> list[WarpPoint]:
     # Sort by source_time
     sorted_a = sorted(anchors, key=lambda p: p.source_time)
 
-    # Find longest strictly increasing subsequence of target_time
-    # using a simple O(n^2) DP (n is small — typically < 1000)
     n = len(sorted_a)
     targets = [p.target_time for p in sorted_a]
+    conf = [p.confidence for p in sorted_a]
 
-    # dp[i] = length of longest increasing subseq ending at i
-    dp = [1] * n
+    # dp[i] = best summed confidence of an increasing subseq ending at i
+    dp = list(conf)
     prev_idx = [-1] * n
 
     for i in range(1, n):
         for j in range(i):
-            if targets[j] < targets[i] and dp[j] + 1 > dp[i]:
-                dp[i] = dp[j] + 1
+            if targets[j] < targets[i] and dp[j] + conf[i] > dp[i]:
+                dp[i] = dp[j] + conf[i]
                 prev_idx[i] = j
 
     # Backtrack to find the actual subsequence

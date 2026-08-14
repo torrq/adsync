@@ -19,6 +19,7 @@ def extract_audio(
     sr: int = 16000,
     mono: bool = True,
     speed_ratio: float | None = None,
+    sample_fmt: str = "s16",
 ) -> Path:
     """Extract an audio stream to a standardized WAV file.
 
@@ -39,6 +40,9 @@ def extract_audio(
         with pitch following — a plain resample, the exact inverse of a
         PAL-style transfer.  Rate-normalize first so the factor applies
         regardless of the source sample rate.
+    sample_fmt:
+        "s16" for analysis WAVs, "f32" for rebuild sources that should not
+        pick up an extra quantization stage.
     """
     if not info.audio_streams:
         raise ValueError(f"No audio streams found in {info.path}")
@@ -53,13 +57,17 @@ def extract_audio(
         shifted = round(sr / speed_ratio)
         filter_args = ["-af", f"aresample={sr},asetrate={shifted},aresample={sr}:filter_size=256:cutoff=0.985"]
 
+    codecs = {"s16": "pcm_s16le", "f32": "pcm_f32le"}
+    if sample_fmt not in codecs:
+        raise ValueError(f"Unsupported sample_fmt {sample_fmt!r} (use 's16' or 'f32')")
+
     args = [
         "-i", info.path,
         "-map", f"0:{stream_index}",
         *filter_args,
         "-ar", str(sr),
         *channels_args,
-        "-c:a", "pcm_s16le",
+        "-c:a", codecs[sample_fmt],
         "-f", "wav",
         str(output_path),
     ]

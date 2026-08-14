@@ -120,15 +120,35 @@ def find_anchors(
 
 
 def _monotonic_filter(anchors: list[Anchor]) -> list[Anchor]:
-    """Keep only anchors whose target_time is strictly increasing."""
+    """Keep the maximum-score strictly increasing subsequence of target_time.
+
+    A greedy scan would make the first anchor mandatory, so one early false
+    match far ahead in the video silently discards every genuine anchor that
+    follows; the DP lets any coherent majority outvote it.
+    """
     if not anchors:
         return []
 
     sorted_a = sorted(anchors, key=lambda a: a.source_time)
-    result: list[Anchor] = [sorted_a[0]]
+    n = len(sorted_a)
+    targets = np.array([a.target_time for a in sorted_a])
+    scores = np.array([a.score for a in sorted_a])
 
-    for a in sorted_a[1:]:
-        if a.target_time > result[-1].target_time:
-            result.append(a)
+    dp = scores.copy()
+    prev = np.full(n, -1, dtype=np.int64)
+    for i in range(1, n):
+        ok = np.nonzero(targets[:i] < targets[i])[0]
+        if len(ok):
+            j = ok[np.argmax(dp[ok])]
+            cand = dp[j] + scores[i]
+            if cand > dp[i]:
+                dp[i] = cand
+                prev[i] = j
 
-    return result
+    best = int(np.argmax(dp))
+    kept: list[Anchor] = []
+    while best != -1:
+        kept.append(sorted_a[best])
+        best = int(prev[best])
+    kept.reverse()
+    return kept
