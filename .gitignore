@@ -55,6 +55,9 @@ sample_data/failure/
 debug_*/
 _probe_*.json
 *_report.json
+*.report.json
+harness_assets/
+harness_out*/
 
 # Personal batch scripts (user-specific paths)
 batch_*.py

@@ -9,7 +9,6 @@ from numpy.typing import NDArray
 
 from adsync.models import SegmentMap
 from adsync.rebuild.retime import retime_segment
-from adsync.utils.mathx import crossfade
 
 log = logging.getLogger("adsync")
 
@@ -21,70 +20,69 @@ def stitch_segments(
     video_duration: float,
     *,
     crossfade_ms: int = 80,
-) -> NDArray[np.floating]:
+) -> NDArray[np.float32]:
     """Build the final synced AD waveform from segments with crossfades.
 
-    This is the careful version that:
-    - Inserts silence for gaps
-    - Crossfades joins
-    - Verifies no clipping or DC offset
+    Inserts silence for gaps, crossfades joins, and clamps the peak.  Accepts
+    1-D (mono) or 2-D (channels, samples) input and returns the same layout.
     """
     if not segments:
-        return y
+        return np.asarray(y, dtype=np.float32)
 
     segments = sorted(segments, key=lambda s: s.dst_start)
     crossfade_samples = int(crossfade_ms * sr / 1000)
-
     output_len = int(video_duration * sr)
 
-    # Build list of (dst_start, audio_chunk) pairs
-    chunks: list[tuple[int, NDArray[np.floating]]] = []
-
+    chunks: list[tuple[int, NDArray[np.float32]]] = []
     for seg in segments:
         retimed = retime_segment(y, sr, seg)
-        if len(retimed) == 0:
+        if retimed.shape[-1] == 0:
             continue
+        retimed -= retimed.mean(axis=-1, keepdims=True).astype(np.float32)
+        chunks.append((int(seg.dst_start * sr), retimed))
 
-        # Owned copy so in-place crossfade ops below are safe.
-        retimed = np.array(retimed, dtype=np.float64)
-        retimed = retimed - np.mean(retimed)
-
-        dst_start_sample = int(seg.dst_start * sr)
-        chunks.append((dst_start_sample, retimed))
-
+    output_shape = (y.shape[0], output_len) if y.ndim == 2 else (output_len,)
     if not chunks:
-        return np.zeros(output_len, dtype=np.float64)
+        return np.zeros(output_shape, dtype=np.float32)
 
-    output = np.zeros(output_len, dtype=np.float64)
+    output = np.zeros(output_shape, dtype=np.float32)
 
     for i, (dst_start, chunk) in enumerate(chunks):
-        end = dst_start + len(chunk)
+        end = dst_start + chunk.shape[-1]
 
         if dst_start < 0:
-            chunk = chunk[-dst_start:]
+            chunk = chunk[..., -dst_start:]
             dst_start = 0
         if end > output_len:
-            chunk = chunk[: output_len - dst_start]
-            end = dst_start + len(chunk)
+            chunk = chunk[..., : output_len - dst_start]
+            end = dst_start + chunk.shape[-1]
 
-        if len(chunk) == 0:
+        if chunk.shape[-1] == 0:
             continue
 
-        if i > 0 and crossfade_samples > 0:
-            prev_end = chunks[i - 1][0] + len(chunks[i - 1][1])
+        if i > 0:
+            prev_end = min(chunks[i - 1][0] + chunks[i - 1][1].shape[-1], output_len)
             overlap = prev_end - dst_start
             if overlap > 0:
-                xf_len = min(crossfade_samples, overlap, len(chunk))
-                fade_in = np.linspace(0.0, 1.0, xf_len)
-                fade_out = np.linspace(1.0, 0.0, xf_len)
-                output[dst_start : dst_start + xf_len] *= fade_out
-                chunk[:xf_len] *= fade_in
+                xf_len = min(crossfade_samples, overlap, chunk.shape[-1])
+                if xf_len > 0:
+                    fade_in = np.linspace(0.0, 1.0, xf_len, dtype=np.float32)
+                    fade_out = np.linspace(1.0, 0.0, xf_len, dtype=np.float32)
+                    output[..., dst_start: dst_start + xf_len] *= fade_out
+                    chunk[..., :xf_len] *= fade_in
+                # A clamped stretch can overshoot the next segment's start by
+                # far more than the crossfade; that tail would play doubled
+                # under the new segment.  The new segment's anchors own this
+                # range — silence the stale audio before adding.
+                stale_end = min(prev_end, end)
+                if stale_end > dst_start + xf_len:
+                    output[..., dst_start + xf_len: stale_end] = 0.0
 
-        output[dst_start:end] += chunk
+        output[..., dst_start:end] += chunk
 
-    peak = np.max(np.abs(output))
+    peak = float(np.max(np.abs(output)))
     if peak > 0.99:
-        output = output * (0.99 / peak)
+        output *= np.float32(0.99 / peak)
         log.debug("Normalized output peak from %.3f to 0.99", peak)
 
     return output

@@ -73,6 +73,11 @@ def sync(
     warp_lambda_curve: float = typer.Option(5.0, "--warp-lambda-curve", help="Warp DP curvature penalty weight"),
     warp_lambda_speech: float = typer.Option(0.3, "--warp-lambda-speech", help="Warp speech bonus weight"),
     warp_candidates: int = typer.Option(5, "--warp-candidates", help="Max offset candidates per analysis window"),
+    warp_search_radius: Optional[float] = typer.Option(None, "--warp-search-radius", help="Per-window search radius in seconds around the detected offset (default: auto from fingerprint spans, duration gap + offset scatter)"),
+    no_fingerprint: bool = typer.Option(False, "--no-fingerprint", help="Skip landmark fingerprinting (global offset-span detection)"),
+    no_speed_detect: bool = typer.Option(False, "--no-speed-detect", help="Skip automatic PAL-style speed detection/correction"),
+    no_fp_anchor: bool = typer.Option(False, "--no-fp-anchor", help="Never anchor alignment windows on fingerprint matches"),
+    no_multiband: bool = typer.Option(False, "--no-multiband", help="Correlate full-band only (skip per-band scoring)"),
 ) -> None:
     """Full sync pipeline — produces synced MKV output."""
     _validate_inputs(video, ad_audio)
@@ -95,6 +100,11 @@ def sync(
         warp_lambda_curve=warp_lambda_curve,
         warp_lambda_speech=warp_lambda_speech,
         warp_max_candidates=warp_candidates,
+        warp_search_radius=warp_search_radius,
+        fingerprint=not no_fingerprint,
+        speed_detect=not no_speed_detect,
+        fp_anchor=not no_fp_anchor,
+        multiband=not no_multiband,
     )
 
     from adsync._pipeline import run_pipeline
@@ -111,6 +121,73 @@ def sync(
     )
 
     raise typer.Exit(0 if result.confidence >= config.confidence_threshold else 1)
+
+
+# ── prep ─────────────────────────────────────────────────────────────────────
+
+
+@app.command()
+def prep(
+    video: Path = typer.Argument(..., help="Source video (e.g. movie.mkv)"),
+    output: Path = typer.Option(None, "-o", "--output", help="Output path (default: <name>.prepped.mkv)"),
+    language: str = typer.Option("eng", "--language", "-l", help="Audio language to keep"),
+    audio_index: Optional[int] = typer.Option(None, "--audio-index", help="Keep this exact audio stream index (overrides --language)"),
+    codec: str = typer.Option("libopus", "--codec", help="Encoder when downmixing (libopus ~4x faster than aac)"),
+    bitrate: Optional[str] = typer.Option(None, "--bitrate", help="Bitrate when downmixing (default: 192k opus / 256k aac)"),
+    no_limiter: bool = typer.Option(False, "--no-limiter", help="Skip the true-peak limiter after downmixing"),
+) -> None:
+    """Prep a video for syncing: keep one language's audio (stereo), drop the rest.
+
+    Video and subtitles are always stream-copied. The kept audio is
+    stream-copied too when it is already stereo/mono; multichannel tracks are
+    downmixed with a dialog-forward formula and a true-peak limiter.
+    """
+    _validate_inputs(video)
+
+    from adsync.media.prep import prep_video
+
+    state = {"last": 0.0}
+
+    def _print_progress(done: float, total: float, speed: float) -> None:
+        # Plain, newline-terminated updates (~every 10 s) instead of a live
+        # bar — legible in logs and pleasant with screen readers.
+        import time as _time
+        now = _time.monotonic()
+        if now - state["last"] < 10.0 or not total or done <= 0:
+            return
+        state["last"] = now
+        pct = min(100.0, 100.0 * done / total)
+        eta = (total - done) / speed if speed > 0 else 0.0
+        console.print(
+            f"  prep {pct:3.0f}%  ({_mmss(done)} / {_mmss(total)})  "
+            f"{speed:.0f}x realtime  eta {_mmss(eta)}"
+        )
+
+    try:
+        result = prep_video(
+            video, output,
+            language=language,
+            audio_index=audio_index,
+            codec=codec,
+            bitrate=bitrate,
+            limiter=not no_limiter,
+            on_progress=_print_progress,
+        )
+    except ValueError as exc:
+        console.print(f"[red]Error:[/red] {exc}")
+        raise typer.Exit(2)
+
+    console.print(
+        f"[green]Prepped → {result.output_path}[/green]  "
+        f"({result.elapsed_sec:.0f} s, audio={result.audio_codec})"
+    )
+
+
+def _mmss(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
 
 
 # ── analyze ──────────────────────────────────────────────────────────────────

@@ -17,8 +17,10 @@ log = logging.getLogger("adsync")
 def export_wav(y: NDArray[np.floating], sr: int, path: Path) -> Path:
     """Write the synced AD waveform to a WAV file."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    sf.write(str(path), y, sr, subtype="PCM_16")
-    log.info("Exported WAV: %s (%.1f s)", path.name, len(y) / sr)
+    # soundfile expects (frames, channels); we store (channels, frames).
+    data = y.T if y.ndim == 2 else y
+    sf.write(str(path), data, sr, subtype="PCM_16")
+    log.info("Exported WAV: %s (%.1f s)", path.name, y.shape[-1] / sr)
     return path
 
 

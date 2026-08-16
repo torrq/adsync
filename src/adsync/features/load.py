@@ -19,5 +19,5 @@ def load_wav(path: Path | str, *, sr: int = 16000, mono: bool = True) -> tuple[N
     always 1-D.
     """
     y, sr_out = librosa.load(str(path), sr=sr, mono=mono)
-    log.debug("Loaded %s — %.2f s, sr=%d", Path(path).name, len(y) / sr_out, sr_out)
+    log.debug("Loaded %s — %.2f s, sr=%d", Path(path).name, y.shape[-1] / sr_out, sr_out)
     return y, sr_out

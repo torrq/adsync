@@ -16,8 +16,10 @@ class StreamInfo(BaseModel):
     codec_type: str
     codec_name: str | None = None
     channels: int | None = None
+    channel_layout: str | None = None
     sample_rate: int | None = None
     language: str | None = None
+    title: str | None = None
     duration: float | None = None
 
 
@@ -67,6 +69,7 @@ class OffsetCandidate(BaseModel):
     score: float
     peak_sharpness: float
     peak_ratio: float
+    source: str = "corr"  # "corr" (cross-correlation) | "fingerprint"
 
 
 class CandidateWindow(BaseModel):
@@ -75,6 +78,14 @@ class CandidateWindow(BaseModel):
     candidates: list[OffsetCandidate]
     speech_score: float
     energy: float
+
+
+class FingerprintSpan(BaseModel):
+    """A stretch of the AD that fingerprint matching placed at one offset."""
+    ad_start: float
+    ad_end: float
+    offset: float
+    matches: int
 
 
 class WarpPoint(BaseModel):
@@ -91,6 +102,9 @@ class WarpPath(BaseModel):
     anchor_points: list[WarpPoint] = Field(default_factory=list)
     path_cost: float = 0.0
     mean_confidence: float = 0.0
+    dropped_segments: int = 0        # excursion segments rejected by vetting
+    bridged_sec: float = 0.0         # AD seconds coasting on flanking offsets
+    n_segments: int = 0              # fitted PCHIP segments
 
 
 class SegmentMap(BaseModel):
@@ -115,3 +129,9 @@ class SyncReport(BaseModel):
     warnings: list[str] = Field(default_factory=list)
     output_path: str | None = None
     warp_path: WarpPath | None = None
+    fingerprint_spans: list[FingerprintSpan] = Field(default_factory=list)
+    fingerprint_unmatched: list[tuple[float, float]] = Field(default_factory=list)
+    speed_stretch: float | None = None      # auto speed correction applied to the AD
+    fp_anchor_windows: int = 0              # windows anchored on fingerprint matches
+    fp_residual_p50_ms: float | None = None  # warp vs fingerprint matches, median
+    fp_residual_p95_ms: float | None = None  # warp vs fingerprint matches, p95

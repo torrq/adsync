@@ -43,8 +43,10 @@ def probe(path: str | Path) -> MediaInfo:
             codec_type=codec_type,
             codec_name=s.get("codec_name"),
             channels=_int_or_none(s.get("channels")),
+            channel_layout=s.get("channel_layout"),
             sample_rate=_int_or_none(s.get("sample_rate")),
             language=tags.get("language"),
+            title=tags.get("title"),
             duration=_float_or_none(s.get("duration") or fmt.get("duration")),
         )
 

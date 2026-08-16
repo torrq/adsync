@@ -8,7 +8,7 @@ import sys
 from rich.console import Console
 from rich.logging import RichHandler
 
-console = Console(stderr=True)
+console = Console(stderr=True, emoji=False)
 
 _LOG_FORMAT = "%(message)s"
 
