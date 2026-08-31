@@ -71,6 +71,8 @@ def run_ffmpeg(args: list[str], *, check: bool = True) -> subprocess.CompletedPr
         cmd,
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         check=False,
     )
     if check and result.returncode != 0:
@@ -133,5 +135,7 @@ def run_ffprobe(args: list[str]) -> subprocess.CompletedProcess[str]:
         cmd,
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         check=True,
     )
