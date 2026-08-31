@@ -68,6 +68,7 @@ def extract_audio(
         "-ar", str(sr),
         *channels_args,
         "-c:a", codecs[sample_fmt],
+        "-rf64", "auto",
         "-f", "wav",
         str(output_path),
     ]
