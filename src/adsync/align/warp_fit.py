@@ -321,13 +321,12 @@ def _vet_and_bridge(
             ad_span = right_p.source_time - left_p.source_time
             video_room = right_p.target_time - left_p.target_time
             if video_room >= ad_span - 0.5:
-                # Video has room: coast on each flank's offset, hole at the
-                # midpoint.
-                mid = 0.5 * (left_p.source_time + right_p.source_time)
+                # Video has room: keep previous-scene audio with the left flank
+                # offset so it does not leak/bleed into the start of the next scene.
                 left_off = left_p.target_time - left_p.source_time
                 right_off = right_p.target_time - right_p.source_time
                 for p in seg:
-                    off = left_off if p.source_time <= mid else right_off
+                    off = left_off if p.source_time < right_p.source_time else right_off
                     new_points.append(WarpPoint(
                         source_time=p.source_time,
                         target_time=p.source_time + off,
